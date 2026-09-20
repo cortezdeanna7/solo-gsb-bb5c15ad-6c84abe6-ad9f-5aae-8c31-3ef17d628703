@@ -912,3 +912,20 @@ table.windows tr.traced td {
   color: #8fc6ff;
   border: 1px solid var(--accent);
 }
+
+/* ---------- 绝对时间观测 ---------- */
+.obs-row { border-left: 3px solid transparent; }
+.trace-step-dir.obs {
+  color: #8fc6ff;
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+.add-row input[type="datetime-local"],
+.constraint-editors input[type="datetime-local"] {
+  font-size: 12.5px;
+  padding: 4px 6px;
+}
+.repair-off-item.obs {
+  border-color: rgba(77, 163, 255, 0.5);
+  background: rgba(77, 163, 255, 0.08);
+}

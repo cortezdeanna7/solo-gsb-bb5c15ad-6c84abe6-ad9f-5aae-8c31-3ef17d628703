@@ -1,18 +1,17 @@
 import type { PriorityLevel, ScheduleResult, TEvent, WindowInfo } from '../types'
-import { formatAbsolute, formatOffset } from '../lib/format'
+import { formatEpochMin } from '../lib/format'
 import { DEFAULT_PRIORITY } from '../lib/schedule'
 
 interface Props {
   events: TEvent[]
-  anchorId: string | null
-  anchorTime: string
   desiredTimes: Record<string, string>
   /** 各事件期望时刻的优先级层级（未设置的按「中」） */
   desiredPriorities: Record<string, PriorityLevel>
-  /** 有效约束系统是否可满足；矛盾时不展示任何旧排程结果 */
+  /** 有效差分系统是否可满足；矛盾时不展示任何旧排程结果 */
   satisfiable: boolean
-  anchorExists: boolean
-  /** 有效时间窗（用于识别未与锚点连通的事件） */
+  /** 是否存在至少一条有效观测（绝对时间基准） */
+  hasObservations: boolean
+  /** 有效时间窗（用于识别未与观测连通的事件） */
   windows: Map<number, WindowInfo>
   /** 排程结果；无可参与期望时为 null */
   schedule: ScheduleResult | null
@@ -36,29 +35,26 @@ const LEVEL_NAME: Record<PriorityLevel, string> = {
 }
 
 /**
- * 分层最小偏差排程面板：为非锚点事件填写期望时刻，并可为每个期望选择
- * 高 / 中 / 低优先级（默认中）。系统对整体差分系统按 高 → 中 → 低 做字典序
- * 最小化：先求本层最小非负整数容差 D，使全部启用约束、已固定的高层容差与本层
- * 每个期望「实际时刻 ∈ 期望 ±D」同时可满足，固定该层容差后再求下一层；
- * 最终输出一份同时满足全部启用约束与各层容差的确定性可行排程。
- * 任何编辑（约束、锚点、期望、层级）都会触发实时重算；约束矛盾时不展示任何旧结果。
+ * 分层最小偏差排程面板：为事件填写期望绝对时刻，并可为每个期望选择
+ * 高 / 中 / 低优先级（默认中）。系统对整体差分系统（相对约束 + 全部观测）
+ * 按 高 → 中 → 低 做字典序最小化：先求本层最小非负整数容差 D，使全部启用边、
+ * 已固定的高层容差与本层每个期望「实际时刻 ∈ 期望 ±D」同时可满足，
+ * 固定该层容差后再求下一层；最终输出一份确定性可行排程。
+ * 任何编辑（约束、观测、期望、层级）都会触发实时重算；矛盾时不展示任何旧结果。
  */
 export default function SchedulePanel({
   events,
-  anchorId,
-  anchorTime,
   desiredTimes,
   desiredPriorities,
   satisfiable,
-  anchorExists,
+  hasObservations,
   windows,
   schedule,
   onDesiredChange,
   onPriorityChange,
 }: Props) {
-  const anchorIdx = anchorId != null ? events.findIndex((e) => e.id === anchorId) : -1
-  const ready = satisfiable && anchorExists
-  const anyDesired = events.some((e) => e.id !== anchorId && !!desiredTimes[e.id])
+  const ready = satisfiable && hasObservations
+  const anyDesired = events.some((e) => !!desiredTimes[e.id])
   // 各层达到 ±D 的事件合集（用于表格中的标记）
   const tight = new Set<number>()
   if (schedule) for (const l of schedule.layers) for (const i of l.tightEventIdx) tight.add(i)
@@ -70,36 +66,36 @@ export default function SchedulePanel({
         <span className="count">
           {schedule
             ? `按 高 → 中 → 低 字典序最小化 · ${schedule.desiredCount} 个期望事件参与整体搜索`
-            : '为非锚点事件填写期望时刻后自动计算'}
+            : '为事件填写期望绝对时刻后自动计算'}
         </span>
       </h3>
 
       {events.length === 0 && (
-        <div className="empty-hint">添加事件、指定锚点并录入约束后，可使用分层最小偏差排程。</div>
+        <div className="empty-hint">添加事件并录入绝对时间观测与约束后，可使用分层最小偏差排程。</div>
       )}
 
       {events.length > 0 && !satisfiable && (
         <div className="schedule-note danger">
-          ⛔ 约束系统存在矛盾，分层最小偏差排程不可用：请先核对证词或按上方修复建议处理。
+          ⛔ 差分系统存在矛盾，分层最小偏差排程不可用：请先核对观测 / 证词或按上方修复建议处理。
           矛盾解除前<strong>不展示任何排程结果</strong>（避免误用过期结论）。
         </div>
       )}
 
-      {events.length > 0 && satisfiable && !anchorExists && (
+      {events.length > 0 && satisfiable && !hasObservations && (
         <div className="schedule-note warn">
-          🎯 尚未指定锚点事件：请先在事件列表中点选锚点并设置锚点绝对时间，再填写期望时刻。
+          🎯 尚未录入任何绝对时间观测：没有绝对时间基准，无法给出绝对排程，请先在
+          「绝对时间观测」面板录入至少一条观测（精确时刻或区间均可）。
         </div>
       )}
 
       {events.length > 0 && ready && (
         <>
           <div className="desired-title">
-            期望时刻（仅非锚点事件；留空则不参与排程；未与锚点连通的事件不参与。
+            期望时刻（留空则不参与排程；未被任何观测连通的事件不参与。
             每个期望可选高 / 中 / 低优先级，默认「中」）
           </div>
           <div className="desired-list">
             {events.map((ev, i) => {
-              if (i === anchorIdx) return null
               const disconnected = windows.get(i)?.status === 'disconnected'
               const val = desiredTimes[ev.id] ?? ''
               const level = desiredPriorities[ev.id] ?? DEFAULT_PRIORITY
@@ -109,7 +105,7 @@ export default function SchedulePanel({
                     {ev.name}
                   </span>
                   {disconnected && (
-                    <span className="badge offlink" title="该事件与锚点没有约束通路，期望时刻不参与排程">
+                    <span className="badge offlink" title="该事件未被任何观测连通，期望时刻不参与排程">
                       未连通
                     </span>
                   )}
@@ -149,7 +145,7 @@ export default function SchedulePanel({
           {!schedule && (
             <div className="empty-hint">
               {anyDesired
-                ? '已填写的期望时刻均属于未与锚点连通的事件，不参与排程；请为可定时事件填写期望时刻。'
+                ? '已填写的期望时刻均属于未被观测连通的事件，不参与排程；请为可定时事件填写期望时刻。'
                 : '还没有期望时刻：填写后系统将按 高 → 中 → 低 字典序搜索各层最小偏差 D，并给出一份确定性的可行排程。'}
             </div>
           )}
@@ -195,7 +191,6 @@ export default function SchedulePanel({
                       <th>层级</th>
                       <th>状态</th>
                       <th className="num">实际时刻</th>
-                      <th className="num">相对锚点</th>
                       <th className="num">期望时刻</th>
                       <th className="num">期望偏差</th>
                     </tr>
@@ -209,7 +204,7 @@ export default function SchedulePanel({
                             {ev.name}
                             {en.status === 'unscheduled' && (
                               <div style={{ color: 'var(--text-muted)', fontSize: 11.5 }}>
-                                未与锚点连通{en.desiredIgnored && '，期望时刻未生效'}
+                                未被任何观测连通{en.desiredIgnored && '，期望时刻未生效'}
                               </div>
                             )}
                           </td>
@@ -226,30 +221,20 @@ export default function SchedulePanel({
                             )}
                           </td>
                           <td>
-                            {en.status === 'anchor' && <span className="status-pill anchor">锚点</span>}
                             {en.status === 'scheduled' && (
                               <span className="status-pill bounded">已定时</span>
                             )}
                             {en.status === 'unscheduled' && (
                               <span
                                 className="status-pill disconnected"
-                                title="与锚点没有任何约束通路，无法定时"
+                                title="未被任何绝对时间观测连通，无法定时"
                               >
                                 未定时
                               </span>
                             )}
                           </td>
-                          <td className="num">
-                            {en.offsetMin !== null ? formatAbsolute(anchorTime, en.offsetMin) : '—'}
-                          </td>
-                          <td className="num">
-                            {en.offsetMin !== null ? formatOffset(en.offsetMin) : '—'}
-                          </td>
-                          <td className="num">
-                            {en.desiredOffset !== null
-                              ? formatAbsolute(anchorTime, en.desiredOffset)
-                              : '—'}
-                          </td>
+                          <td className="num">{formatEpochMin(en.actualMin)}</td>
+                          <td className="num">{formatEpochMin(en.desiredMin)}</td>
                           <td className="num">
                             {en.deviation !== null ? (
                               <>

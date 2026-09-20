@@ -1,4 +1,4 @@
-import type { AppState, Constraint, TEvent } from '../types'
+import type { AppState, Constraint, Observation, TEvent } from '../types'
 
 /** 生成简短唯一 id（无需 crypto 也可运行） */
 export function uid(prefix = 'id'): string {
@@ -9,9 +9,27 @@ function mkEvent(name: string, note?: string): TEvent {
   return { id: uid('ev'), name, note }
 }
 
+/** 精确时刻观测（零宽区间） */
+function exactObservation(eventId: string, iso: string): Observation {
+  return { id: uid('obs'), eventId, earliest: iso, latest: iso, enabled: true }
+}
+
+/** 区间观测：事件时刻在相对锚点基准 lo~hi 分钟之间 */
+function intervalObservation(eventId: string, baseISO: string, lo: number, hi: number): Observation {
+  return {
+    id: uid('obs'),
+    eventId,
+    earliest: plusMinutes(baseISO, lo),
+    latest: plusMinutes(baseISO, hi),
+    enabled: true,
+  }
+}
+
 /**
- * 可满足示例：事故复盘时间线（锚点为“值班告警触发”）。
- * 其中“媒体报道”与主体事件没有任何约束连接，用于演示“无法定时”。
+ * 可满足示例：事故复盘时间线。
+ * “值班告警触发”上有一条精确观测（绝对时间锚点，由旧版单锚点数据等价迁移而来），
+ * “复盘会议”上另有一条区间观测，演示多观测共同收紧时间窗。
+ * “媒体报道”与主体事件没有任何约束连接，用于演示“无法定时”。
  */
 export function buildConsistentSample(): AppState {
   const alert = mkEvent('值班告警触发', '监控系统 P1 告警')
@@ -41,17 +59,23 @@ export function buildConsistentSample(): AppState {
   ]
   const constraints = E.map((e) => ({ ...e, id: uid('ct') }))
 
+  const baseTime = defaultAnchorTime()
+  const observations: Observation[] = [
+    // 精确观测：告警触发时刻（等价旧版锚点）
+    exactObservation(alert.id, baseTime),
+    // 区间观测：复盘会议发生在 +100 ~ +150 分钟（与约束窗 +70 ~ +200 取交集）
+    intervalObservation(postmortem.id, baseTime, 100, 150),
+  ]
+
   // 期望时刻演示：期望恢复 +25 分钟（窗口 [10,20] 之外，高优先级层最优容差 D=5）、
   // 期望复盘 +120 分钟（低优先级，在高层容差固定后仍可达，D=0）
-  const anchorTime = defaultAnchorTime()
   return {
     events,
     constraints,
-    anchorId: alert.id,
-    anchorTime,
+    observations,
     desiredTimes: {
-      [recovered.id]: plusMinutes(anchorTime, 25),
-      [postmortem.id]: plusMinutes(anchorTime, 120),
+      [recovered.id]: plusMinutes(baseTime, 25),
+      [postmortem.id]: plusMinutes(baseTime, 120),
     },
     desiredPriorities: {
       [recovered.id]: 'high',
@@ -66,6 +90,7 @@ export function buildConsistentSample(): AppState {
  * 证人二：C 比 B 晚 5~10 分钟；
  * 证人三：A 比 C 晚 10~30 分钟。
  * 三个“晚于”沿环相加要求 t_A - t_A <= -25，构成负环。
+ * A 上的精确观测给出绝对时间基准（矛盾本身与观测无关，修复只需停用证词）。
  */
 export function buildContradictionSample(): AppState {
   const A = mkEvent('A：车辆驶入路口')
@@ -84,20 +109,18 @@ export function buildContradictionSample(): AppState {
   return {
     events,
     constraints,
-    anchorId: A.id,
-    anchorTime: defaultAnchorTime(),
+    observations: [exactObservation(A.id, defaultAnchorTime())],
     desiredTimes: {},
     desiredPriorities: {},
   }
 }
 
-/** 空状态（保留默认锚点时间） */
+/** 空状态 */
 export function emptyState(): AppState {
   return {
     events: [],
     constraints: [],
-    anchorId: null,
-    anchorTime: defaultAnchorTime(),
+    observations: [],
     desiredTimes: {},
     desiredPriorities: {},
   }

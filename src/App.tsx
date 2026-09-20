@@ -1,31 +1,35 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AppState, Constraint, PriorityLevel, TEvent } from './types'
-import { analyze, traceBound } from './lib/graph'
+import type { AppState, Constraint, Observation, PriorityLevel, TEvent } from './types'
+import { analyze, edgeKey, traceBound } from './lib/graph'
 import { findMinimalRepairs } from './lib/repair'
 import { computeMinDeviationSchedule } from './lib/schedule'
 import {
   buildConsistentSample,
   buildContradictionSample,
-  defaultAnchorTime,
   emptyState,
   uid,
 } from './lib/samples'
 import { clearState, loadState, saveState } from './lib/storage'
-import { formatFullDateTime } from './lib/format'
 import EventEditor from './components/EventEditor'
 import ConstraintEditor from './components/ConstraintEditor'
+import ObservationEditor from './components/ObservationEditor'
 import GraphView from './components/GraphView'
 import CyclePanel from './components/CyclePanel'
 import WindowsTable from './components/WindowsTable'
 import RepairPanel from './components/RepairPanel'
 import SchedulePanel from './components/SchedulePanel'
 
+interface PreviewOff {
+  constraintIds: Set<string>
+  observationIds: Set<string>
+}
+
 export default function App() {
   const [state, setState] = useState<AppState>(() => loadState() ?? buildConsistentSample())
   // 修复方案预览：仅内存生效，不写入 localStorage；任何编辑操作都会退出预览
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
   // 边界追溯请求：点击时间窗表中某事件的最早/最晚时间后设置；
-  // 编辑数据、切换锚点、进入/退出修复预览时自动清除
+  // 编辑数据、进入/退出修复预览时自动清除
   const [traceReq, setTraceReq] = useState<{ eventIdx: number; kind: 'earliest' | 'latest' } | null>(null)
 
   // 本地持久化：任何修改实时写入 localStorage（预览状态不入存储）
@@ -33,12 +37,12 @@ export default function App() {
     saveState(state)
   }, [state])
 
-  const { events, constraints, anchorId, anchorTime, desiredTimes, desiredPriorities } = state
+  const { events, constraints, observations, desiredTimes, desiredPriorities } = state
 
-  // —— 原始数据的实时分析（用于矛盾判定与修复搜索）——
+  // —— 原始数据的实时分析（相对约束 + 绝对观测同图，用于矛盾判定与修复搜索）——
   const result = useMemo(
-    () => analyze(events, constraints, anchorId),
-    [events, constraints, anchorId],
+    () => analyze(events, constraints, observations),
+    [events, constraints, observations],
   )
 
   // —— 最小修复建议：仅在检测到矛盾（负环）时搜索 ——
@@ -46,49 +50,68 @@ export default function App() {
     () =>
       result.satisfiable
         ? null
-        : findMinimalRepairs(events, constraints, anchorId),
-    [events, constraints, anchorId, result.satisfiable],
+        : findMinimalRepairs(events, constraints, observations),
+    [events, constraints, observations, result.satisfiable],
   )
 
   // —— 预览中的停用集合 ——
-  const previewOffIds = useMemo(() => {
+  const previewOff: PreviewOff | null = useMemo(() => {
     if (previewIndex === null || !repair) return null
-    return new Set(repair.plans[previewIndex]?.disableConstraintIds ?? [])
+    const plan = repair.plans[previewIndex]
+    if (!plan) return null
+    return {
+      constraintIds: new Set(
+        plan.disableItems.filter((d) => d.origin === 'constraint').map((d) => d.sourceId),
+      ),
+      observationIds: new Set(
+        plan.disableItems.filter((d) => d.origin === 'observation').map((d) => d.sourceId),
+      ),
+    }
   }, [previewIndex, repair])
 
-  // —— 叠加预览后的约束与分析结果（不修改 state，因此不会写入 localStorage）——
+  // —— 叠加预览后的约束/观测与分析结果（不修改 state，因此不会写入 localStorage）——
   const effectiveConstraints = useMemo(() => {
-    if (!previewOffIds) return constraints
+    if (!previewOff) return constraints
     return constraints.map((c) =>
-      previewOffIds.has(c.id) ? { ...c, enabled: false } : c,
+      previewOff.constraintIds.has(c.id) ? { ...c, enabled: false } : c,
     )
-  }, [constraints, previewOffIds])
+  }, [constraints, previewOff])
+
+  const effectiveObservations = useMemo(() => {
+    if (!previewOff) return observations
+    return observations.map((o) =>
+      previewOff.observationIds.has(o.id) ? { ...o, enabled: false } : o,
+    )
+  }, [observations, previewOff])
 
   const effectiveResult = useMemo(() => {
-    if (!previewOffIds) return result
-    return analyze(events, effectiveConstraints, anchorId)
-  }, [events, effectiveConstraints, anchorId, previewOffIds, result])
+    if (!previewOff) return result
+    return analyze(events, effectiveConstraints, effectiveObservations)
+  }, [events, effectiveConstraints, effectiveObservations, previewOff, result])
 
-  // —— 分层最小偏差排程：仅在有效系统可满足且已设置锚点时计算；
-  //    编辑约束、锚点、期望值或优先级层级都会触发实时重算，矛盾时返回 null（不展示旧结果）——
-  const anchorExists = anchorId != null && events.some((e) => e.id === anchorId)
+  const hasObservations = effectiveResult.clockIdx !== null
+  const previewing = previewOff !== null
+
+  // —— 分层最小偏差排程：仅在有效系统可满足且存在观测（绝对基准）时计算；
+  //    编辑约束、观测、期望值或优先级都会触发实时重算，矛盾时返回 null（不展示旧结果）——
   const schedule = useMemo(() => {
-    if (!effectiveResult.satisfiable || !anchorExists) return null
+    if (!effectiveResult.satisfiable || !hasObservations) return null
     return computeMinDeviationSchedule(
       events,
       effectiveConstraints,
-      anchorId,
-      anchorTime,
+      effectiveObservations,
       desiredTimes,
       desiredPriorities,
     )
-  }, [effectiveResult.satisfiable, anchorExists, events, effectiveConstraints, anchorId, anchorTime, desiredTimes, desiredPriorities])
+  }, [effectiveResult.satisfiable, hasObservations, events, effectiveConstraints, effectiveObservations, desiredTimes, desiredPriorities])
 
-  // 矛盾环相关集合（用于跨组件高亮；预览可满足时为空）
+  // 矛盾链相关集合（用于跨组件高亮；预览可满足时为空）
   const cycleEventIds = useMemo(() => {
     const s = new Set<string>()
     if (!effectiveResult.satisfiable && effectiveResult.cycle) {
-      for (const i of effectiveResult.cycle.nodes) if (events[i]) s.add(events[i].id)
+      for (const i of effectiveResult.cycle.nodes) {
+        if (events[i]) s.add(events[i].id)
+      }
     }
     return s
   }, [effectiveResult, events])
@@ -96,7 +119,19 @@ export default function App() {
   const cycleConstraintIds = useMemo(() => {
     const s = new Set<string>()
     if (!effectiveResult.satisfiable && effectiveResult.cycle) {
-      for (const e of effectiveResult.cycle.edges) s.add(e.constraintId)
+      for (const e of effectiveResult.cycle.edges) {
+        if (e.origin === 'constraint') s.add(e.sourceId)
+      }
+    }
+    return s
+  }, [effectiveResult])
+
+  const cycleObservationIds = useMemo(() => {
+    const s = new Set<string>()
+    if (!effectiveResult.satisfiable && effectiveResult.cycle) {
+      for (const e of effectiveResult.cycle.edges) {
+        if (e.origin === 'observation') s.add(e.sourceId)
+      }
     }
     return s
   }, [effectiveResult])
@@ -104,7 +139,7 @@ export default function App() {
   const cycleEdgeIds = useMemo(() => {
     const s = new Set<string>()
     if (!effectiveResult.satisfiable && effectiveResult.cycle) {
-      for (const e of effectiveResult.cycle.edges) s.add(`${e.constraintId}:${e.bound}`)
+      for (const e of effectiveResult.cycle.edges) s.add(edgeKey(e))
     }
     return s
   }, [effectiveResult])
@@ -116,15 +151,32 @@ export default function App() {
     return s
   }, [effectiveResult])
 
-  // —— 边界依据追溯：按当前有效约束（含修复预览）重新计算紧约束链 ——
+  // 录有有效观测的事件（用于事件列表徽章）
+  const observedEventIds = useMemo(() => {
+    const s = new Set<string>()
+    if (effectiveResult.clockIdx !== null) {
+      for (const [i, w] of effectiveResult.windows) {
+        if (w.observed && events[i]) s.add(events[i].id)
+      }
+    }
+    return s
+  }, [effectiveResult, events])
+
+  // —— 边界依据追溯：按当前有效约束与观测（含修复预览）重新计算紧约束链 ——
   const trace = useMemo(() => {
-    if (!traceReq || !anchorId || !effectiveResult.satisfiable) return null
-    return traceBound(events, effectiveConstraints, anchorId, traceReq.eventIdx, traceReq.kind)
-  }, [traceReq, events, effectiveConstraints, anchorId, effectiveResult.satisfiable])
+    if (!traceReq || !effectiveResult.satisfiable) return null
+    return traceBound(
+      events,
+      effectiveConstraints,
+      effectiveObservations,
+      traceReq.eventIdx,
+      traceReq.kind,
+    )
+  }, [traceReq, events, effectiveConstraints, effectiveObservations, effectiveResult.satisfiable])
 
   const traceEdgeIds = useMemo(() => {
     const s = new Set<string>()
-    if (trace) for (const st of trace.steps) s.add(`${st.edge.constraintId}:${st.edge.bound}`)
+    if (trace) for (const st of trace.steps) s.add(edgeKey(st.edge))
     return s
   }, [trace])
 
@@ -132,19 +184,28 @@ export default function App() {
     const s = new Set<number>()
     if (trace) {
       s.add(trace.eventIdx)
-      const ai = events.findIndex((e) => e.id === anchorId)
-      if (ai >= 0) s.add(ai)
+      s.add(trace.clockIdx)
       for (const st of trace.steps) {
         s.add(st.from)
         s.add(st.to)
       }
     }
     return s
-  }, [trace, events, anchorId])
+  }, [trace])
 
   const traceConstraintIds = useMemo(() => {
     const s = new Set<string>()
-    if (trace) for (const st of trace.steps) s.add(st.edge.constraintId)
+    if (trace) {
+      for (const st of trace.steps) if (st.edge.origin === 'constraint') s.add(st.edge.sourceId)
+    }
+    return s
+  }, [trace])
+
+  const traceObservationIds = useMemo(() => {
+    const s = new Set<string>()
+    if (trace) {
+      for (const st of trace.steps) if (st.edge.origin === 'observation') s.add(st.edge.sourceId)
+    }
     return s
   }, [trace])
 
@@ -156,18 +217,14 @@ export default function App() {
   }
 
   const activeCount = constraints.filter((c) => c.enabled).length
-  const previewing = previewOffIds !== null
+  const activeObsCount = observations.filter((o) => o.enabled).length
 
   // —— 编辑操作（均退出预览并清除边界追溯，避免预览/追溯与新数据错位）——
   const addEvent = (name: string, note: string) => {
     setPreviewIndex(null)
     setTraceReq(null)
     const ev: TEvent = { id: uid('ev'), name, note: note || undefined }
-    setState((s) => ({
-      ...s,
-      events: [...s.events, ev],
-      anchorId: s.anchorId ?? ev.id,
-    }))
+    setState((s) => ({ ...s, events: [...s.events, ev] }))
   }
 
   const removeEvent = (id: string) => {
@@ -182,7 +239,7 @@ export default function App() {
         ...s,
         events: s.events.filter((e) => e.id !== id),
         constraints: s.constraints.filter((c) => c.aId !== id && c.bId !== id),
-        anchorId: s.anchorId === id ? null : s.anchorId,
+        observations: s.observations.filter((o) => o.eventId !== id),
         desiredTimes,
         desiredPriorities,
       }
@@ -196,12 +253,6 @@ export default function App() {
       ...s,
       events: s.events.map((e) => (e.id === id ? { ...e, name } : e)),
     }))
-  }
-
-  const setAnchor = (id: string) => {
-    // 切换锚点后旧的推导链不再适用，清除追溯
-    setTraceReq(null)
-    setState((s) => ({ ...s, anchorId: id }))
   }
 
   const addConstraint = (c: Omit<Constraint, 'id'>) => {
@@ -230,6 +281,28 @@ export default function App() {
         if (Number.isFinite(next.min) && next.min > next.max) next.min = next.max
         return next
       }),
+    }))
+  }
+
+  // —— 观测：新增 / 编辑 / 删除，实时重算并持久化 ——
+  const addObservation = (o: Omit<Observation, 'id'>) => {
+    setPreviewIndex(null)
+    setTraceReq(null)
+    setState((s) => ({ ...s, observations: [...s.observations, { ...o, id: uid('obs') }] }))
+  }
+
+  const removeObservation = (id: string) => {
+    setPreviewIndex(null)
+    setTraceReq(null)
+    setState((s) => ({ ...s, observations: s.observations.filter((o) => o.id !== id) }))
+  }
+
+  const updateObservation = (id: string, patch: Partial<Observation>) => {
+    setPreviewIndex(null)
+    setTraceReq(null)
+    setState((s) => ({
+      ...s,
+      observations: s.observations.map((o) => (o.id === id ? { ...o, ...patch } : o)),
     }))
   }
 
@@ -267,7 +340,7 @@ export default function App() {
   }
 
   const resetAll = () => {
-    if (!window.confirm('确定清空全部事件、约束与本地存储数据吗？')) return
+    if (!window.confirm('确定清空全部事件、约束、观测与本地存储数据吗？')) return
     setPreviewIndex(null)
     setTraceReq(null)
     clearState()
@@ -276,7 +349,7 @@ export default function App() {
 
   // —— 修复方案：预览 / 确认应用 ——
   const previewRepair = (i: number) => {
-    // 进入预览后按有效约束重新计算，旧追溯一律清除
+    // 进入预览后按有效条目重新计算，旧追溯一律清除
     setTraceReq(null)
     setPreviewIndex(i)
   }
@@ -288,14 +361,22 @@ export default function App() {
     if (!repair) return
     const plan = repair.plans[i]
     if (!plan) return
-    const off = new Set(plan.disableConstraintIds)
+    const offConstraints = new Set(
+      plan.disableItems.filter((d) => d.origin === 'constraint').map((d) => d.sourceId),
+    )
+    const offObservations = new Set(
+      plan.disableItems.filter((d) => d.origin === 'observation').map((d) => d.sourceId),
+    )
     setPreviewIndex(null)
     setTraceReq(null)
-    // 确认后批量停用对应约束（state 变更即写入 localStorage）
+    // 确认后批量停用对应约束/观测（state 变更即写入 localStorage）
     setState((s) => ({
       ...s,
       constraints: s.constraints.map((c) =>
-        off.has(c.id) ? { ...c, enabled: false } : c,
+        offConstraints.has(c.id) ? { ...c, enabled: false } : c,
+      ),
+      observations: s.observations.map((o) =>
+        offObservations.has(o.id) ? { ...o, enabled: false } : o,
       ),
     }))
   }
@@ -307,38 +388,38 @@ export default function App() {
         cls: 'warn',
         icon: '📋',
         title: '等待录入',
-        desc: '添加事件并指定锚点后开始分析。也可以直接载入下方示例数据。',
+        desc: '添加事件并录入至少一条绝对时间观测后开始分析。也可以直接载入下方示例数据。',
       }
     }
     if (!effectiveResult.satisfiable) {
       return {
         cls: 'danger',
         icon: '⛔',
-        title: '约束相互矛盾，不存在任何可行的事件时间安排',
-        desc: `差分约束图中检测到负环（环上权重之和为 ${effectiveResult.cycle?.totalWeight} 分钟 < 0）。红色标出的环即一条可复核的矛盾链：请核对对应证词或记录；下方同时给出停用约束最少的修复建议。`,
+        title: '观测与约束相互矛盾，不存在任何可行的事件时间安排',
+        desc: `统一差分约束图中检测到负权环（环上权重之和为 ${effectiveResult.cycle?.totalWeight} 分钟 < 0）。红色标出的矛盾链同时引用涉及的绝对观测与原始相对约束，可逐步复核；下方同时给出停用条目最少的修复建议。`,
       }
     }
     if (previewing) {
       return {
         cls: 'ok',
         icon: '👁️',
-        title: '修复预览：停用建议中的约束后，系统恢复可满足',
+        title: '修复预览：停用建议中的约束/观测后，系统恢复可满足',
         desc: '当前为临时预览，停用尚未写入浏览器本地存储；确认无误后请在方案卡片上点击“确认应用”，或退出预览返回原数据。',
       }
     }
-    if (!anchorExists) {
+    if (!hasObservations) {
       return {
         cls: 'warn',
         icon: '🎯',
-        title: '约束系统本身一致，但尚未指定锚点事件',
-        desc: '在事件列表中点选单选按钮指定锚点，并设置锚点绝对时间，即可得到各事件的最早 / 最晚时间窗。',
+        title: '相对约束系统本身一致，但尚无生效的绝对时间观测',
+        desc: '在「绝对时间观测」面板为事件录入精确时刻或观测区间（可多条），即可统一求解各事件的绝对时间窗。',
       }
     }
     return {
       cls: 'ok',
       icon: '✅',
-      title: '约束可满足：存在与全部约束相容的时间安排',
-      desc: `共 ${events.length} 个事件、${activeCount} 条生效约束。下表给出每个事件相对锚点的最早与最晚时间；与锚点无约束通路的事件标记为“无法定时”。`,
+      title: '观测与约束可满足：存在与全部观测、约束相容的时间安排',
+      desc: `共 ${events.length} 个事件、${activeCount} 条生效相对约束、${activeObsCount} 条生效观测。下表给出每个事件的绝对时间窗；未被任何观测连通的事件标记为“无法定时”。`,
     }
   })()
 
@@ -348,7 +429,7 @@ export default function App() {
         <div>
           <h1>事件时序约束校验器</h1>
           <div className="subtitle">
-            采访证词 / 事故复盘 · 差分约束图（Difference Constraints）实时可满足性判定
+            采访证词 / 事故复盘 · 多观测区间 + 相对约束统一差分图（Difference Constraints）实时可满足性判定
           </div>
         </div>
         <div className="toolbar">
@@ -359,36 +440,6 @@ export default function App() {
           </button>
         </div>
       </header>
-
-      {/* 锚点 */}
-      <div className="anchor-bar">
-        <label className="title">锚点</label>
-        <select
-          value={anchorId ?? ''}
-          onChange={(e) => setAnchor(e.target.value)}
-          aria-label="锚点事件"
-        >
-          <option value="">（未选择）</option>
-          {events.map((e) => (
-            <option key={e.id} value={e.id}>
-              {e.name}
-            </option>
-          ))}
-        </select>
-        <label className="title" style={{ fontWeight: 400 }}>
-          锚点绝对时间
-        </label>
-        <input
-          type="datetime-local"
-          value={anchorTime}
-          onChange={(e) => {
-            // 锚点时间也属于编辑：清除旧追溯（偏移链不变，但避免展示过期结论）
-            setTraceReq(null)
-            setState((s) => ({ ...s, anchorTime: e.target.value || defaultAnchorTime() }))
-          }}
-        />
-        <span className="anchor-absolute">= {formatFullDateTime(anchorTime)}</span>
-      </div>
 
       {/* 判定横幅 */}
       <div className={`status-banner ${banner.cls}`}>
@@ -401,18 +452,20 @@ export default function App() {
               cycle={effectiveResult.cycle}
               events={events}
               constraints={effectiveConstraints}
+              observations={effectiveObservations}
+              clockIdx={effectiveResult.clockIdx}
             />
           )}
         </div>
       </div>
 
       {/* 修复预览提示条（预览不写入 localStorage） */}
-      {previewing && (
+      {previewing && previewOff && (
         <div className="preview-bar">
           <span>
             👁️ 正在<strong>预览修复方案 {previewIndex! + 1}</strong>
-            ：已临时停用 {previewOffIds!.size} 条约束（约束列表中置灰并标记“预览停用”），
-            本预览<strong>不会写入 localStorage</strong>。
+            ：已临时停用 {previewOff.constraintIds.size} 条约束、{previewOff.observationIds.size} 条观测
+            （列表中置灰并标记“预览停用”），本预览<strong>不会写入 localStorage</strong>。
           </span>
           <button className="small" onClick={exitPreview}>
             退出预览
@@ -426,9 +479,8 @@ export default function App() {
           <RepairPanel
             events={events}
             constraints={constraints}
+            observations={observations}
             repair={repair}
-            anchorId={anchorId}
-            anchorTime={anchorTime}
             previewIndex={previewIndex}
             onPreview={previewRepair}
             onExitPreview={exitPreview}
@@ -441,12 +493,14 @@ export default function App() {
       <div className="panel graph-panel" style={{ marginBottom: 16 }}>
         <h3>
           差分约束图
-          <span className="count">边标签 w 表示 t终点 − t起点 ≤ w（分钟）</span>
+          <span className="count">
+            边标签 w 表示 t终点 − t起点 ≤ w（分钟）；观测边为虚线，连至圆心“绝对时间零点”
+          </span>
         </h3>
         <GraphView
           events={events}
           constraints={effectiveConstraints}
-          anchorId={anchorId}
+          observations={effectiveObservations}
           cycleNodes={cycleNodeIdx}
           cycleEdgeIds={cycleEdgeIds}
           traceNodes={traceNodeIdx}
@@ -458,50 +512,62 @@ export default function App() {
       <div className="grid-2">
         <EventEditor
           events={events}
-          anchorId={anchorId}
+          observedEventIds={observedEventIds}
           cycleEventIds={cycleEventIds}
           onAdd={addEvent}
           onRemove={removeEvent}
           onRename={renameEvent}
-          onSetAnchor={setAnchor}
         />
         <ConstraintEditor
           events={events}
           constraints={effectiveConstraints}
           cycleConstraintIds={cycleConstraintIds}
           traceConstraintIds={traceConstraintIds}
-          previewOffIds={previewOffIds}
+          previewOffIds={previewOff?.constraintIds ?? null}
           onAdd={addConstraint}
           onRemove={removeConstraint}
           onUpdate={updateConstraint}
         />
       </div>
 
+      {/* 绝对时间观测（新增/编辑/删除实时重算并持久化） */}
+      <div style={{ marginTop: 16 }}>
+        <ObservationEditor
+          events={events}
+          observations={effectiveObservations}
+          cycleObservationIds={cycleObservationIds}
+          traceObservationIds={traceObservationIds}
+          previewOffIds={previewOff?.observationIds ?? null}
+          onAdd={addObservation}
+          onRemove={removeObservation}
+          onUpdate={updateObservation}
+        />
+      </div>
+
       {/* 时间窗（预览时展示修复后的窗口；正常可满足时展示当前窗口） */}
       {effectiveResult.satisfiable && (
-        <WindowsTable
-          events={events}
-          windows={effectiveResult.windows}
-          cycleEventIds={cycleEventIds}
-          anchorId={anchorId}
-          anchorTime={anchorTime}
-          trace={trace}
-          constraints={effectiveConstraints}
-          onTrace={requestTrace}
-          onCloseTrace={() => setTraceReq(null)}
-        />
+        <div style={{ marginTop: 16 }}>
+          <WindowsTable
+            events={events}
+            windows={effectiveResult.windows}
+            cycleEventIds={cycleEventIds}
+            trace={trace}
+            constraints={effectiveConstraints}
+            observations={effectiveObservations}
+            onTrace={requestTrace}
+            onCloseTrace={() => setTraceReq(null)}
+          />
+        </div>
       )}
 
       {/* 分层最小偏差排程：期望时刻与优先级填写 + 高→中→低字典序搜索得到的可行排程 */}
       <div style={{ marginTop: 16 }}>
         <SchedulePanel
           events={events}
-          anchorId={anchorId}
-          anchorTime={anchorTime}
           desiredTimes={desiredTimes}
           desiredPriorities={desiredPriorities}
           satisfiable={effectiveResult.satisfiable}
-          anchorExists={anchorExists}
+          hasObservations={hasObservations}
           windows={effectiveResult.windows}
           schedule={schedule}
           onDesiredChange={setDesiredTime}
@@ -510,9 +576,10 @@ export default function App() {
       </div>
 
       <div className="footer-note">
-        数据自动保存在浏览器 localStorage，刷新不丢失 · 停用某条约束可即时验证“去掉该证词后矛盾是否消除” ·
+        数据自动保存在浏览器 localStorage，刷新不丢失 · 旧版单锚点存档打开时自动迁移为一条精确观测 ·
+        停用某条约束或观测可即时验证“去掉该证词/记录后矛盾是否消除” ·
         修复方案的“一键预览”仅在内存生效，点击“确认应用”才会批量停用并写入本地存储 ·
-        期望时刻与优先级层级随项目一同持久化，编辑约束、锚点、期望值或层级后分层最小偏差排程实时重算
+        观测、期望时刻与优先级层级随项目一同持久化，任何编辑都实时重算
       </div>
     </div>
   )
