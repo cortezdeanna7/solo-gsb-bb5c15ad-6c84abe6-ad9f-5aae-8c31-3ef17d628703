@@ -1,17 +1,18 @@
 import { useMemo } from 'react'
-import type { Constraint, DiffEdge, TEvent } from '../types'
-import { buildEdges } from '../lib/graph'
+import type { Constraint, DiffEdge, TimeObservation, TEvent } from '../types'
+import { buildSystem } from '../lib/graph'
 
 interface Props {
   events: TEvent[]
   constraints: Constraint[]
-  anchorId: string | null
+  observations: TimeObservation[]
   cycleNodes: Set<number>
-  cycleEdgeIds: Set<string> // "constraintId:bound"
-  /** 边界追溯链上的节点（含锚点与目标事件） */
+  /** 高亮边的全局键：edgeKey(edge) = `${kind}:${id}:${bound}` */
+  cycleEdgeKeys: Set<string>
+  /** 边界追溯链上的节点（含时间原点与目标事件） */
   traceNodes?: Set<number>
-  /** 边界追溯链上的边，键同 cycleEdgeIds */
-  traceEdgeIds?: Set<string>
+  /** 边界追溯链上的边，键同 cycleEdgeKeys */
+  traceEdgeKeys?: Set<string>
 }
 
 const W = 760
@@ -21,8 +22,18 @@ const CY = H / 2
 const R = 180
 const NODE_R = 26
 
-function nodePos(i: number, n: number): { x: number; y: number } {
-  if (n === 1) return { x: CX, y: CY }
+/** 差分边的全局标识键（约束边与观测边各有命名空间） */
+export function edgeKey(e: DiffEdge): string {
+  return e.kind === 'observation'
+    ? `observation:${e.observationId ?? ''}:${e.bound}`
+    : `constraint:${e.constraintId ?? ''}:${e.bound}`
+}
+
+function nodePos(i: number, n: number, originPresent: boolean): { x: number; y: number } {
+  if (n === 1) {
+    // 唯一事件需给中心时间原点让位：放在原点正上方
+    return originPresent ? { x: CX, y: CY - R * 0.8 } : { x: CX, y: CY }
+  }
   const ang = -Math.PI / 2 + (2 * Math.PI * i) / n
   return { x: CX + R * Math.cos(ang), y: CY + R * Math.sin(ang) }
 }
@@ -37,19 +48,25 @@ interface Arc {
 }
 
 /**
- * 差分约束图可视化：环形布局，边 u -> v 标注权重 w（表示 t_v - t_u <= w）。
- * 矛盾环上的节点与边以红色突出显示；边界追溯链以紫色突出显示。
+ * 差分约束图可视化：事件节点环形布局，中心为虚拟「时间原点 t₀」（仅在存在有效观测时
+ * 出现观测边）。相对约束边为灰蓝色，观测边为琥珀色；矛盾环红色、追溯链紫色。
  */
 export default function GraphView({
   events,
   constraints,
-  anchorId,
+  observations,
   cycleNodes,
-  cycleEdgeIds,
+  cycleEdgeKeys,
   traceNodes,
-  traceEdgeIds,
+  traceEdgeKeys,
 }: Props) {
-  const { edges } = useMemo(() => buildEdges(events, constraints), [events, constraints])
+  const sys = useMemo(
+    () => buildSystem(events, constraints, observations),
+    [events, constraints, observations],
+  )
+  const edges = sys.edges
+  const originIdx = sys.originIdx
+  const hasOriginEdges = useMemo(() => edges.some((e) => e.kind === 'observation'), [edges])
 
   const arcs = useMemo<Arc[]>(() => {
     const n = events.length
@@ -58,31 +75,45 @@ export default function GraphView({
     const pairSeen = new Map<string, number>()
 
     return edges.map((edge) => {
-      const p1 = nodePos(edge.u, n)
-      const p2 = nodePos(edge.v, n)
+      const p1 = posOf(edge.u)
+      const p2 = posOf(edge.v)
       const unordered = [edge.u, edge.v].sort((a, b) => a - b).join(':')
       pairCount.set(unordered, (pairCount.get(unordered) ?? 0) + 1)
       const ord = pairSeen.get(unordered) ?? 0
       pairSeen.set(unordered, ord + 1)
 
       const { path, lx, ly } = arcPath(p1, p2, edge.u === edge.v, ord, pairCount.get(unordered) ?? 1)
-      const key = `${edge.constraintId}:${edge.bound}`
+      const key = edgeKey(edge)
       return {
         edge,
         path,
         lx,
         ly,
-        inCycle: cycleEdgeIds.has(key),
-        inTrace: traceEdgeIds?.has(key) ?? false,
+        inCycle: cycleEdgeKeys.has(key),
+        inTrace: traceEdgeKeys?.has(key) ?? false,
       }
     })
-  }, [edges, events.length, cycleEdgeIds, traceEdgeIds])
+
+    /** 事件节点环形排布；时间原点固定在画布中心（仅在有观测边时占据中心） */
+    function posOf(idx: number): { x: number; y: number } {
+      return idx === originIdx ? { x: CX, y: CY } : nodePos(idx, n, hasOriginEdges)
+    }
+  }, [edges, events.length, originIdx, hasOriginEdges, cycleEdgeKeys, traceEdgeKeys])
 
   if (events.length === 0) {
     return <div className="graph-empty">添加事件后，这里将展示差分约束图</div>
   }
 
   const n = events.length
+  const originInCycle = cycleNodes.has(originIdx)
+  const originInTrace = traceNodes?.has(originIdx) ?? false
+
+  const edgeColor = (a: Arc) =>
+    a.inCycle ? '#f85149' : a.inTrace ? '#bc8cff' : a.edge.kind === 'observation' ? '#e3a008' : '#5b7186'
+  const edgeMarker = (a: Arc) =>
+    a.inCycle ? 'url(#arrow-cycle)' : a.inTrace ? 'url(#arrow-trace)' : 'url(#arrow)'
+  const edgeTextColor = (a: Arc) =>
+    a.inCycle ? '#ff8f8a' : a.inTrace ? '#d2a8ff' : a.edge.kind === 'observation' ? '#f0c674' : '#8da2b5'
 
   return (
     <div className="graph-wrap">
@@ -104,10 +135,11 @@ export default function GraphView({
             <path
               d={a.path}
               fill="none"
-              stroke={a.inCycle ? '#f85149' : a.inTrace ? '#bc8cff' : '#5b7186'}
-              strokeWidth={a.inCycle || a.inTrace ? 2.6 : 1.3}
-              markerEnd={a.inCycle ? 'url(#arrow-cycle)' : a.inTrace ? 'url(#arrow-trace)' : 'url(#arrow)'}
-              opacity={a.inCycle || a.inTrace ? 1 : 0.85}
+              stroke={edgeColor(a)}
+              strokeWidth={a.inCycle || a.inTrace ? 2.6 : 1.4}
+              strokeDasharray={a.edge.kind === 'observation' && !a.inCycle && !a.inTrace ? '6 3' : undefined}
+              markerEnd={edgeMarker(a)}
+              opacity={a.inCycle || a.inTrace ? 1 : a.edge.kind === 'observation' ? 0.95 : 0.85}
             />
             <text
               x={a.lx}
@@ -116,7 +148,7 @@ export default function GraphView({
               dominantBaseline="central"
               fontSize="11"
               fontFamily="ui-monospace, monospace"
-              fill={a.inCycle ? '#ff8f8a' : a.inTrace ? '#d2a8ff' : '#8da2b5'}
+              fill={edgeTextColor(a)}
               stroke="#1a212b"
               strokeWidth="3.5"
               paintOrder="stroke"
@@ -127,13 +159,12 @@ export default function GraphView({
         ))}
 
         {events.map((ev, i) => {
-          const { x, y } = nodePos(i, n)
-          const isAnchor = ev.id === anchorId
+          const { x, y } = nodePos(i, n, hasOriginEdges)
           const inCycle = cycleNodes.has(i)
           const inTrace = traceNodes?.has(i) ?? false
-          const fill = isAnchor ? '#1f3a57' : inCycle ? '#3d1f22' : inTrace ? '#2d2440' : '#222c38'
-          const stroke = inCycle ? '#f85149' : isAnchor ? '#4da3ff' : inTrace ? '#bc8cff' : '#46586b'
-          const emphasized = isAnchor || inCycle || inTrace
+          const fill = inCycle ? '#3d1f22' : inTrace ? '#2d2440' : '#222c38'
+          const stroke = inCycle ? '#f85149' : inTrace ? '#bc8cff' : '#46586b'
+          const emphasized = inCycle || inTrace
           const label = ev.name.length > 6 ? `${ev.name.slice(0, 5)}…` : ev.name
           return (
             <g key={ev.id}>
@@ -145,35 +176,64 @@ export default function GraphView({
                 dominantBaseline="central"
                 fontSize="12"
                 fontWeight={emphasized ? 700 : 500}
-                fill={inCycle ? '#ff8f8a' : isAnchor ? '#cfe6ff' : inTrace ? '#d2a8ff' : '#e6edf3'}
+                fill={inCycle ? '#ff8f8a' : inTrace ? '#d2a8ff' : '#e6edf3'}
               >
                 {label}
-              </text>
-              <text x={x} y={y + NODE_R + 14} textAnchor="middle" fontSize="10.5" fill="#6b7d8f">
-                {isAnchor ? '锚点' : ''}
               </text>
             </g>
           )
         })}
+
+        {/* 虚拟时间原点 t0（中心）：仅在有观测边时显示 */}
+        {hasOriginEdges && (
+          <g>
+            <circle
+              cx={CX}
+              cy={CY}
+              r={NODE_R + 2}
+              fill={originInCycle ? '#3d1f22' : originInTrace ? '#2d2440' : '#332a12'}
+              stroke={originInCycle ? '#f85149' : originInTrace ? '#bc8cff' : '#e3a008'}
+              strokeWidth={originInCycle || originInTrace ? 2.6 : 2.0}
+            />
+            <text
+              x={CX}
+              y={CY}
+              textAnchor="middle"
+              dominantBaseline="central"
+              fontSize="12"
+              fontWeight={700}
+              fill={originInCycle ? '#ff8f8a' : originInTrace ? '#d2a8ff' : '#f0c674'}
+            >
+              t₀
+            </text>
+            <text x={CX} y={CY + NODE_R + 15} textAnchor="middle" fontSize="10.5" fill="#c99a2e">
+              时间原点
+            </text>
+          </g>
+        )}
       </svg>
       <div className="graph-legend">
         <span>
           <span className="swatch" style={{ background: '#5b7186' }} />
-          差分约束边（标注权重 w，含义 t终点 − t起点 ≤ w）
+          相对约束边（t终点 − t起点 ≤ w，分钟）
+        </span>
+        <span>
+          <span className="swatch" style={{ background: '#e3a008' }} />
+          绝对时间观测边（与时间原点 t₀ 相连，虚线）
         </span>
         <span>
           <span className="swatch" style={{ background: '#f85149' }} />
           矛盾环
         </span>
-        {(traceEdgeIds?.size ?? 0) > 0 && (
+        {(traceEdgeKeys?.size ?? 0) > 0 && (
           <span>
             <span className="swatch" style={{ background: '#bc8cff' }} />
             边界追溯链
           </span>
         )}
         <span>
-          <span className="swatch" style={{ background: '#4da3ff' }} />
-          锚点事件
+          <span className="swatch" style={{ background: '#e3a008', borderRadius: '50%', width: 10, height: 10 }} />
+          时间原点 t₀ = 最早观测起点
         </span>
       </div>
     </div>

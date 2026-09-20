@@ -1,4 +1,4 @@
-import type { AppState, Constraint, TEvent } from '../types'
+import type { AppState, Constraint, TEvent, TimeObservation } from '../types'
 
 /** 生成简短唯一 id（无需 crypto 也可运行） */
 export function uid(prefix = 'id'): string {
@@ -10,7 +10,7 @@ function mkEvent(name: string, note?: string): TEvent {
 }
 
 /**
- * 可满足示例：事故复盘时间线（锚点为“值班告警触发”）。
+ * 可满足示例：事故复盘时间线（对“值班告警触发”有一条精确时刻观测）。
  * 其中“媒体报道”与主体事件没有任何约束连接，用于演示“无法定时”。
  */
 export function buildConsistentSample(): AppState {
@@ -41,14 +41,19 @@ export function buildConsistentSample(): AppState {
   ]
   const constraints = E.map((e) => ({ ...e, id: uid('ct') }))
 
+  // 绝对时间观测：值班告警 08:00 触发（精确时刻，零宽区间）；
+  // 另对复盘会议有一条较宽的现场记录区间，用于演示多条观测共同定时。
+  const anchorTime = defaultAnchorTime()
+  const observations: TimeObservation[] = [
+    { id: uid('obs'), eventId: alert.id, start: anchorTime, end: anchorTime },
+  ]
+
   // 期望时刻演示：期望恢复 +25 分钟（窗口 [10,20] 之外，高优先级层最优容差 D=5）、
   // 期望复盘 +120 分钟（低优先级，在高层容差固定后仍可达，D=0）
-  const anchorTime = defaultAnchorTime()
   return {
     events,
     constraints,
-    anchorId: alert.id,
-    anchorTime,
+    observations,
     desiredTimes: {
       [recovered.id]: plusMinutes(anchorTime, 25),
       [postmortem.id]: plusMinutes(anchorTime, 120),
@@ -66,6 +71,7 @@ export function buildConsistentSample(): AppState {
  * 证人二：C 比 B 晚 5~10 分钟；
  * 证人三：A 比 C 晚 10~30 分钟。
  * 三个“晚于”沿环相加要求 t_A - t_A <= -25，构成负环。
+ * 同时对 A 有一条精确观测，使矛盾环连接到绝对时间轴（修复建议停用 1 条证词即可）。
  */
 export function buildContradictionSample(): AppState {
   const A = mkEvent('A：车辆驶入路口')
@@ -81,23 +87,22 @@ export function buildContradictionSample(): AppState {
     { aId: D.id, bId: C.id, relation: 'later', min: 8, max: 25, enabled: true },
   ]
   const constraints = E.map((e) => ({ ...e, id: uid('ct') }))
+  const t = defaultAnchorTime()
   return {
     events,
     constraints,
-    anchorId: A.id,
-    anchorTime: defaultAnchorTime(),
+    observations: [{ id: uid('obs'), eventId: A.id, start: t, end: t }],
     desiredTimes: {},
     desiredPriorities: {},
   }
 }
 
-/** 空状态（保留默认锚点时间） */
+/** 空状态 */
 export function emptyState(): AppState {
   return {
     events: [],
     constraints: [],
-    anchorId: null,
-    anchorTime: defaultAnchorTime(),
+    observations: [],
     desiredTimes: {},
     desiredPriorities: {},
   }
@@ -111,7 +116,7 @@ export function defaultAnchorTime(): string {
 }
 
 /** 在 ISO 本地时间上叠加分钟偏移，返回 datetime-local 格式 */
-function plusMinutes(iso: string, min: number): string {
+export function plusMinutes(iso: string, min: number): string {
   const d = new Date(iso)
   d.setMinutes(d.getMinutes() + min)
   return toLocalISO(d)

@@ -3,22 +3,18 @@ import type { TEvent } from '../types'
 
 interface Props {
   events: TEvent[]
-  anchorId: string | null
   cycleEventIds: Set<string>
   onAdd: (name: string, note: string) => void
   onRemove: (id: string) => void
   onRename: (id: string, name: string) => void
-  onSetAnchor: (id: string) => void
 }
 
 export default function EventEditor({
   events,
-  anchorId,
   cycleEventIds,
   onAdd,
   onRemove,
   onRename,
-  onSetAnchor,
 }: Props) {
   const [name, setName] = useState('')
   const [note, setNote] = useState('')
@@ -42,13 +38,6 @@ export default function EventEditor({
 
       {events.map((ev) => (
         <div className="event-row" key={ev.id}>
-          <input
-            type="radio"
-            name="anchor-event"
-            title="设为锚点事件"
-            checked={ev.id === anchorId}
-            onChange={() => onSetAnchor(ev.id)}
-          />
           <div className="name">
             <input
               value={ev.name}
@@ -58,9 +47,8 @@ export default function EventEditor({
             />
             {ev.note && <div className="note">{ev.note}</div>}
           </div>
-          {ev.id === anchorId && <span className="badge anchor">锚点</span>}
           {cycleEventIds.has(ev.id) && <span className="badge cycle">矛盾环</span>}
-          <button className="small danger-ghost" onClick={() => onRemove(ev.id)} title="删除事件及其相关约束">
+          <button className="small danger-ghost" onClick={() => onRemove(ev.id)} title="删除事件及其相关约束与观测">
             删除
           </button>
         </div>
